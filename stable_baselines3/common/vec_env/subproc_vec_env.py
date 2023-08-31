@@ -3,6 +3,9 @@ import warnings
 from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
@@ -118,13 +121,18 @@ class SubprocVecEnv(VecEnv):
 
         self.remotes[0].send(("get_spaces", None))
         observation_space, action_space = self.remotes[0].recv()
+        self.thread_pool = ThreadPoolExecutor(num_workers = os.cpu_count())
 
         super().__init__(len(env_fns), observation_space, action_space)
 
     def step_async(self, actions: np.ndarray) -> None:
+        task_list = []
         for remote, action in zip(self.remotes, actions):
-            remote.send(("step", action))
+            task_list.append(self.thread_pool.submit(remote.send, "step", action))
+            #remote.send(("step", action))
         self.waiting = True
+        for task in task_list:
+            task.result()
 
     def step_wait(self) -> VecEnvStepReturn:
         results = [remote.recv() for remote in self.remotes]
@@ -183,8 +191,12 @@ class SubprocVecEnv(VecEnv):
     def env_method(self, method_name: str, *method_args, indices: VecEnvIndices = None, **method_kwargs) -> List[Any]:
         """Call instance methods of vectorized environments."""
         target_remotes = self._get_target_remotes(indices)
+        task_list = []
         for remote in target_remotes:
-            remote.send(("env_method", (method_name, method_args, method_kwargs)))
+            task_list.append(self.thread_pool.submit(remote.send, "env_method", (method_name, method_args, method_kwargs)))
+            #remote.send(("env_method", (method_name, method_args, method_kwargs)))
+        for task in task_list:
+            task.result()
         return [remote.recv() for remote in target_remotes]
 
     def env_is_wrapped(self, wrapper_class: Type[gym.Wrapper], indices: VecEnvIndices = None) -> List[bool]:

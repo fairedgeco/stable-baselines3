@@ -148,6 +148,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         :return: True if function returned with at least `n_rollout_steps`
             collected, False if callback terminated rollout prematurely.
         """
+        function_start_time = time.time()
         assert self._last_obs is not None, "No previous observation was provided"
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
@@ -160,7 +161,13 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         callback.on_rollout_start()
 
+        sum_of_cal_time = 0
+        sum_of_step_time = 0
+        sum_of_left_time = 0
+        sum_of_buffer_time = 0 
+
         while n_steps < n_rollout_steps:
+            start_time = time.time()
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
@@ -170,14 +177,20 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
+            predit_time = time.time()
+            sum_of_cal_time += int((predit_time - start_time) * 1000)
 
             # Rescale and perform action
             clipped_actions = actions
             # Clip the actions to avoid out of bound error
             if isinstance(self.action_space, spaces.Box):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+            
 
+            start_time = time.time()
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            step_time = time.time()
+            sum_of_step_time += int((step_time - start_time) * 1000)
 
             self.num_timesteps += env.num_envs
 
@@ -188,6 +201,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
             self._update_info_buffer(infos)
             n_steps += 1
+
 
             if isinstance(self.action_space, spaces.Discrete):
                 # Reshape in case of discrete action
@@ -206,6 +220,9 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                     rewards[idx] += self.gamma * terminal_value
 
+            update_buffer_time = time.time()
+            sum_of_buffer_time += (update_buffer_time - step_time) * 1000
+
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
                 actions,
@@ -216,10 +233,18 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
+            left_time = time.time()
+            sum_of_left_time += (left_time - update_buffer_time) * 1000
 
         with th.no_grad():
             # Compute value for the last timestep
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+        
+        print("Sum of time", sum_of_cal_time / 1000, sum_of_step_time/ 1000, sum_of_buffer_time / 1000, sum_of_left_time / 1000)
+        print("Sum of time", sum_of_cal_time / 1000  + sum_of_step_time/ 1000 + sum_of_buffer_time / 1000 + sum_of_left_time / 1000)
+        print("Sum of time of function", time.time() - function_start_time)
+        print(dones)
+        sys.exit(0)
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 

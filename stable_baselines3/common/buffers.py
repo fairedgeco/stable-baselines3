@@ -467,6 +467,7 @@ class RolloutBuffer(BaseBuffer):
         if self.pos == self.buffer_size:
             self.full = True
 
+
     def get(self, batch_size: Optional[int] = None) -> Generator[RolloutBufferSamples, None, None]:
         assert self.full, ""
         indices = np.random.permutation(self.buffer_size * self.n_envs)
@@ -736,6 +737,46 @@ class DictRolloutBuffer(RolloutBuffer):
         self.advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.generator_ready = False
         super(RolloutBuffer, self).reset()
+    
+    def set_from_buffer_list(self, buffer_list):
+        same_size = True 
+        size = buffer_list[0].pos
+        for idx in range(1,len(buffer_list)):
+            if buffer_list[idx].pos != size:
+                same_size = False
+                break
+        assert same_size, ("All the items in the list need to have the same length", size, buffer_list[idx].pos)
+
+        for key in self.observations.keys():
+            stack_array_list = [item.observations[key] for item in buffer_list]
+            import hashlib
+            hash_list = [hashlib.sha1(item).hexdigest()  for item in stack_array_list]
+            print(hash_list)
+            self.observations[key][:size] = np.concatenate(stack_array_list, axis=1)
+        stack_array_list = [ item.actions for item in buffer_list]
+        self.actions[:size] = np.concatenate(stack_array_list, axis=1)
+
+        stack_array_list = [ item.rewards for item in buffer_list]
+        self.rewards[:size] = np.concatenate(stack_array_list, axis=1)
+
+        stack_array_list = [ item.returns for item in buffer_list]
+        self.returns[:size] = np.concatenate(stack_array_list, axis=1)
+
+        stack_array_list = [ item.episode_starts for item in buffer_list]
+        self.episode_starts[:size] = np.concatenate(stack_array_list, axis=1)
+
+        stack_array_list = [ item.values for item in buffer_list]
+        self.values[:size] = np.concatenate(stack_array_list, axis=1)
+
+        stack_array_list = [ item.log_probs for item in buffer_list]
+        self.log_probs[:size] = np.concatenate(stack_array_list, axis=1)
+
+        stack_array_list = [ item.advantages for item in buffer_list]
+        self.advantages[:size] = np.concatenate(stack_array_list, axis=1)
+
+        self.pos = size
+        if self.pos == self.buffer_size:
+            self.full = True
 
     def add(
         self,
@@ -767,6 +808,7 @@ class DictRolloutBuffer(RolloutBuffer):
             if isinstance(self.observation_space.spaces[key], spaces.Discrete):
                 obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
             self.observations[key][self.pos] = obs_
+    
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
@@ -819,3 +861,142 @@ class DictRolloutBuffer(RolloutBuffer):
             advantages=self.to_torch(self.advantages[batch_inds].flatten()),
             returns=self.to_torch(self.returns[batch_inds].flatten()),
         )
+
+class SharedDictRolloutBuffer(DictRolloutBuffer):
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        buffer = None,
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        self.already_init = False 
+        #self.buffer = buffer
+        super(RolloutBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+
+        assert isinstance(self.obs_shape, dict), "SharedDictRolloutBuffer must be used with Dict obs space only"
+
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+
+        self.generator_ready = False
+        self.reset(buffer)
+    
+    def nbytes(self):
+        self.sum_of_bytes = 0
+        for key, obs_input_shape in self.obs_shape.items():
+            self.sum_of_bytes += self.observations[key].nbytes
+
+        self.sum_of_bytes += self.actions.nbytes
+        self.sum_of_bytes += self.rewards.nbytes
+        self.sum_of_bytes += self.returns.nbytes
+        self.sum_of_bytes += self.episode_starts.nbytes
+        self.sum_of_bytes += self.values.nbytes
+        self.sum_of_bytes += self.log_probs.nbytes
+        self.sum_of_bytes += self.advantages.nbytes
+
+        return self.sum_of_bytes
+
+    def from_buffer(self, buffer) -> None:
+        assert isinstance(self.obs_shape, dict), "DictRolloutBuffer must be used with Dict obs space only"
+        self.observations = {}
+        current_bytes = 0
+        for key, obs_input_shape in self.obs_shape.items():
+            self.observations[key] = np.ndarray((self.buffer_size, self.n_envs, *obs_input_shape), dtype=np.float32, buffer=buffer, offset=current_bytes)
+            current_bytes += self.observations[key].nbytes
+            #self.observations[key] = np.zeros((self.buffer_size, self.n_envs, *obs_input_shape), dtype=np.float32)
+
+        self.actions = np.ndarray((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.actions.nbytes
+        
+        self.rewards = np.ndarray((self.buffer_size, self.n_envs), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.rewards.nbytes
+
+        self.returns = np.ndarray((self.buffer_size, self.n_envs), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.returns.nbytes
+
+        self.episode_starts = np.ndarray((self.buffer_size, self.n_envs), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.episode_starts.nbytes
+
+        self.values = np.ndarray((self.buffer_size, self.n_envs), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.values.nbytes
+
+        self.log_probs = np.ndarray((self.buffer_size, self.n_envs), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.log_probs.nbytes
+
+        self.advantages = np.ndarray((self.buffer_size, self.n_envs), dtype=np.float32, buffer=buffer, offset=current_bytes)
+        current_bytes += self.advantages.nbytes
+    
+    #def set_buffer(self, buffer):
+    #    self.buffer = buffer
+    def reset(self, buffer = None):
+        #if buffer:
+        #    self.buffer = buffer
+        if not buffer and not self.already_init:
+            print("Reset None buffer")
+            super().reset()
+            return
+        print("Reset with buffer")
+        if buffer:
+            self.from_buffer(buffer)
+
+        for key, obs_input_shape in self.obs_shape.items():
+            self.observations[key].fill(0)
+        self.actions.fill(0)
+        self.rewards.fill(0)
+        self.returns.fill(0)
+        self.episode_starts.fill(0)
+        self.values.fill(0)
+        self.log_probs.fill(0)
+        self.advantages.fill(0)
+        self.generator_ready = False
+
+
+    def add(
+        self,
+        obs: Dict[str, np.ndarray],
+        action: np.ndarray,
+        reward: np.ndarray,
+        episode_start: np.ndarray,
+        value: th.Tensor,
+        log_prob: th.Tensor,
+        rank: int,
+        pos: int,
+    ) -> None:  # pytype: disable=signature-mismatch
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        for key in self.observations.keys():
+            obs_ = np.array(obs[key]).copy()
+            # Reshape needed when using multiple envs with discrete observations
+            # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+            if isinstance(self.observation_space.spaces[key], spaces.Discrete):
+                obs_ = obs_.reshape((1,) + self.obs_shape[key])
+            self.observations[key][pos, rank] = obs_
+    
+
+        # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+        action = action.reshape((1, self.action_dim))
+
+        self.actions[pos, rank] = np.array(action).copy()
+        self.rewards[pos, rank] = np.array(reward).copy()
+        self.episode_starts[pos, rank] = np.array(episode_start).copy()
+        self.values[pos, rank] = value.clone().cpu().numpy().flatten()
+        self.log_probs[pos, rank] = log_prob.clone().cpu().numpy()
+        if pos == self.buffer_size:
+            self.full = True

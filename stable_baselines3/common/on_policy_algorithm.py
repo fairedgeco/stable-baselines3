@@ -7,15 +7,38 @@ import torch as th
 from gymnasium import spaces
 
 from stable_baselines3.common.base_class import BaseAlgorithm
-from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
+from stable_baselines3.common.buffers import SharedDictRolloutBuffer, RolloutBuffer, DictRolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import obs_as_tensor, safe_mean
-from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.common.vec_env import VecEnv, SubprocVecEnv
 
 SelfOnPolicyAlgorithm = TypeVar("SelfOnPolicyAlgorithm", bound="OnPolicyAlgorithm")
 
+class create_rf():
+    def __init__(self, buffer_cls, n_steps, observation_space, action_space, device, gamma, gae_lambda, n_envs):
+        self.buffer_cls = buffer_cls
+        self.n_steps = n_steps
+        self.observation_space = observation_space
+        self.action_space = action_space 
+        self.device = device 
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.n_envs = n_envs
+
+    
+    def create(self, buffer):
+        return self.buffer_cls(
+            self.n_steps,
+            self.observation_space,
+            self.action_space,
+            buffer = buffer,
+            device=self.device,
+            gamma=self.gamma,
+            gae_lambda=self.gae_lambda,
+            n_envs=self.n_envs, 
+        )
 
 class OnPolicyAlgorithm(BaseAlgorithm):
     """
@@ -108,7 +131,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        buffer_cls = DictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else RolloutBuffer
+        #buffer_cls = DictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else RolloutBuffer
+        buffer_cls = SharedDictRolloutBuffer if isinstance(self.observation_space, spaces.Dict) else RolloutBuffer
 
         self.rollout_buffer = buffer_cls(
             self.n_steps,
@@ -119,12 +143,65 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
         )
+
         # pytype:disable=not-instantiable
         self.policy = self.policy_class(  # type: ignore[assignment]
             self.observation_space, self.action_space, self.lr_schedule, use_sde=self.use_sde, **self.policy_kwargs
         )
         # pytype:enable=not-instantiable
         self.policy = self.policy.to(self.device)
+
+        if isinstance(self.env, SubprocVecEnv):
+            self.env.set_rollout_buffer(self.rollout_buffer, 
+                                        create_rf(buffer_cls, self.n_steps, self.observation_space,
+                                         self.action_space, self.device, self.gamma, self.gae_lambda, self.n_envs))
+            self.policy.set_training_mode(False)
+            self.env.set_model(self.policy)
+
+    def collect_rollouts_one_time(
+        self,
+        env: VecEnv,
+        callback: BaseCallback,
+        rollout_buffer: RolloutBuffer,
+        n_rollout_steps: int,
+    ) -> bool:
+        #def create_buffer():
+        #    one_rollout_buffer = type(rollout_buffer)(
+        #        self.n_steps,
+        #        self.observation_space,
+        #        self.action_space,
+        #        device=self.device,
+        #        gamma=self.gamma,
+        #        gae_lambda=self.gae_lambda,
+        #        n_envs=1,
+        #    )
+        #    return one_rollout_buffer
+        #env.set_rollout_buffer(create_buffer)
+
+        start_time = time.time()
+        print("advantages: shape", rollout_buffer.advantages.shape)
+
+        # Used to verify model is same with sub-process
+        #for param in self.policy.parameters():
+        #    print(param.data.sum())
+
+        data = (n_rollout_steps,
+                self.device, self.action_space, self.gamma, self._last_episode_starts[0])
+
+        print("Sum of rewards before rollout", rollout_buffer.rewards.sum())
+
+        last_values, dones = env.rollout(rollout_buffer, data)
+        print("advantages: shape", rollout_buffer.advantages.shape)
+
+        print("Sum of rewards after rollout", rollout_buffer.rewards.sum())
+        rollout_buffer.compute_returns_and_advantage(last_values=last_values, dones=dones)
+        rollout_buffer.full = True
+        self.num_timesteps += env.num_envs * n_rollout_steps
+
+        #callback.on_rollout_end()
+        #rollout_buffer.set_from_buffer_list(results)
+        print("Sum of the time in collect_rollouts_one_time", time.time() - start_time)
+
 
     def collect_rollouts(
         self,
@@ -146,19 +223,25 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         :return: True if function returned with at least `n_rollout_steps`
             collected, False if callback terminated rollout prematurely.
         """
+        function_start_time = time.time()
         assert self._last_obs is not None, "No previous observation was provided"
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
 
         n_steps = 0
-        rollout_buffer.reset()
         # Sample new weights for the state dependent exploration
         if self.use_sde:
             self.policy.reset_noise(env.num_envs)
 
         callback.on_rollout_start()
 
+        sum_of_cal_time = 0
+        sum_of_step_time = 0
+        sum_of_left_time = 0
+        sum_of_buffer_time = 0 
+
         while n_steps < n_rollout_steps:
+            start_time = time.time()
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
@@ -168,14 +251,20 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
             actions = actions.cpu().numpy()
+            predit_time = time.time()
+            sum_of_cal_time += int((predit_time - start_time) * 1000)
 
             # Rescale and perform action
             clipped_actions = actions
             # Clip the actions to avoid out of bound error
             if isinstance(self.action_space, spaces.Box):
                 clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+            
 
+            start_time = time.time()
             new_obs, rewards, dones, infos = env.step(clipped_actions)
+            step_time = time.time()
+            sum_of_step_time += int((step_time - start_time) * 1000)
 
             self.num_timesteps += env.num_envs
 
@@ -186,6 +275,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
             self._update_info_buffer(infos)
             n_steps += 1
+
 
             if isinstance(self.action_space, spaces.Discrete):
                 # Reshape in case of discrete action
@@ -204,6 +294,9 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                         terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                     rewards[idx] += self.gamma * terminal_value
 
+            update_buffer_time = time.time()
+            sum_of_buffer_time += (update_buffer_time - step_time) * 1000
+
             rollout_buffer.add(
                 self._last_obs,  # type: ignore[arg-type]
                 actions,
@@ -214,14 +307,20 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
+            left_time = time.time()
+            sum_of_left_time += (left_time - update_buffer_time) * 1000
 
         with th.no_grad():
             # Compute value for the last timestep
             values = self.policy.predict_values(obs_as_tensor(new_obs, self.device))  # type: ignore[arg-type]
+        
+        print("Sum of time", sum_of_cal_time / 1000, sum_of_step_time/ 1000, sum_of_buffer_time / 1000, sum_of_left_time / 1000)
+        print("Sum of time", sum_of_cal_time / 1000  + sum_of_step_time/ 1000 + sum_of_buffer_time / 1000 + sum_of_left_time / 1000)
+        print("Sum of time of function", time.time() - function_start_time)
+        print(dones)
+        sys.exit(0)
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
-
-        callback.update_locals(locals())
 
         callback.on_rollout_end()
 
@@ -257,8 +356,10 @@ class OnPolicyAlgorithm(BaseAlgorithm):
 
         assert self.env is not None
 
+        print(total_timesteps)
         while self.num_timesteps < total_timesteps:
-            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+            #continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+            continue_training = self.collect_rollouts_one_time(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
 
             if continue_training is False:
                 break

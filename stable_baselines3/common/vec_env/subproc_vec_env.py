@@ -1,7 +1,9 @@
 import multiprocessing as mp
 import warnings
 from collections import OrderedDict
+from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Type, Union
+from stable_baselines3.common.preprocessing import get_obs_shape
 
 import gymnasium as gym
 import numpy as np
@@ -16,6 +18,14 @@ from stable_baselines3.common.vec_env.base_vec_env import (
 )
 from stable_baselines3.common.vec_env.patch_gym import _patch_env
 
+def copy_obervation_to_share_mem(observation, shm):
+    new_observation = {}
+    current_bytes = 0
+    for key, val in observation.items():
+        new_observation[key] = np.ndarray(val.shape, dtype=val.dtype, buffer=shm.buf, offset = current_bytes)
+        current_bytes += val.nbytes
+        np.copyto(new_observation[key], val)
+    return new_observation
 
 def _worker(
     remote: mp.connection.Connection,
@@ -40,10 +50,14 @@ def _worker(
                     # save final observation where user can get it, then reset
                     info["terminal_observation"] = observation
                     observation, reset_info = env.reset()
-                remote.send((observation, reward, done, info, reset_info))
+                new_obervation = copy_obervation_to_share_mem(observation, shm)
+                remote.send((reward, done, info, reset_info))
             elif cmd == "reset":
                 observation, reset_info = env.reset(seed=data)
-                remote.send((observation, reset_info))
+                new_obervation = copy_obervation_to_share_mem(observation, shm)
+                remote.send((reset_info))
+            elif cmd == "set_shared_mem":
+                shm = shared_memory.SharedMemory(name=data, create=False)
             elif cmd == "render":
                 remote.send(env.render())
             elif cmd == "close":
@@ -125,18 +139,38 @@ class SubprocVecEnv(VecEnv):
         for remote, action in zip(self.remotes, actions):
             remote.send(("step", action))
         self.waiting = True
+    
+    def create_shared_mem(self, nbytes):
+        self.shared_mem_list = [shared_memory.SharedMemory(size=nbytes, create=True) for _ in self.remotes]
+        for shm, remote in zip(self.shared_mem_list, self.remotes):
+            remote.send(("set_shared_mem", shm.name))
+
+    def get_obs_from_shared_mem(self):
+        obs_shape = get_obs_shape(self.observation_space)
+        observations = [] 
+        for shm, remote in zip(self.shared_mem_list, self.remotes):
+            observation = {}
+            current_ntypes = 0
+            for key, obs_input_shape in obs_shape.items():
+                observation[key] = np.ndarray(obs_input_shape, dtype=np.float32, buffer = shm.buf, offset = current_ntypes)
+                current_ntypes += observation[key].nbytes
+            observations.append(observation)
+        return observations
+
 
     def step_wait(self) -> VecEnvStepReturn:
         results = [remote.recv() for remote in self.remotes]
         self.waiting = False
-        obs, rews, dones, infos, self.reset_infos = zip(*results)
+        rews, dones, infos, self.reset_infos = zip(*results)
+        obs = self.get_obs_from_shared_mem()
         return _flatten_obs(obs, self.observation_space), np.stack(rews), np.stack(dones), infos
 
     def reset(self) -> VecEnvObs:
         for env_idx, remote in enumerate(self.remotes):
             remote.send(("reset", self._seeds[env_idx]))
         results = [remote.recv() for remote in self.remotes]
-        obs, self.reset_infos = zip(*results)
+        self.reset_infos = zip(*results)
+        obs = self.get_obs_from_shared_mem()
         # Seeds are only used once
         self._reset_seeds()
         return _flatten_obs(obs, self.observation_space)

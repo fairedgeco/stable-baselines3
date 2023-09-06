@@ -126,6 +126,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         # pytype:enable=not-instantiable
         self.policy = self.policy.to(self.device)
 
+        self.env.create_shared_mem(self.rollout_buffer.observation_nbytes())
+
     def collect_rollouts(
         self,
         env: VecEnv,

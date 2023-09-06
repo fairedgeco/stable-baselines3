@@ -737,6 +737,13 @@ class DictRolloutBuffer(RolloutBuffer):
         self.generator_ready = False
         super(RolloutBuffer, self).reset()
 
+    def observation_nbytes(self):
+        sum_of_bytes = 0
+        for key, obs_input_shape in self.obs_shape.items():
+            sum_of_bytes += int(self.observations[key].nbytes / self.n_envs)
+        return sum_of_bytes
+
+
     def add(
         self,
         obs: Dict[str, np.ndarray],

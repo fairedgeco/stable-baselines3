@@ -175,6 +175,9 @@ class PPO(OnPolicyAlgorithm):
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
 
+    def set_thread_lock(self, lock):
+        self.lock = lock
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
@@ -201,6 +204,7 @@ class PPO(OnPolicyAlgorithm):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
+                self.lock.acquire()
                 sum_of_get += time.time() - previous_time
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
@@ -277,6 +281,7 @@ class PPO(OnPolicyAlgorithm):
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
+                self.lock.release()
                 previous_time = time.time()
 
             self._n_updates += 1

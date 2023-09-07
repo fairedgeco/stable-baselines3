@@ -721,6 +721,8 @@ class DictRolloutBuffer(RolloutBuffer):
 
         self.generator_ready = False
         self.reset()
+        from concurrent.futures import ThreadPoolExecutor
+        self.thread_pool = ThreadPoolExecutor(max_workers=16)
 
     def reset(self) -> None:
         assert isinstance(self.obs_shape, dict), "DictRolloutBuffer must be used with Dict obs space only"
@@ -743,6 +745,12 @@ class DictRolloutBuffer(RolloutBuffer):
             sum_of_bytes += int(self.observations[key].nbytes / self.n_envs)
         return sum_of_bytes
 
+    def add_observation(self, key, pos, obs_):
+        assert pos < self.buffer_size
+        if isinstance(self.observation_space.spaces[key], spaces.Discrete):
+            obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
+        self.observations[key][pos] = obs_
+        return self.observations[key][pos]
 
     def add(
         self,
@@ -766,26 +774,72 @@ class DictRolloutBuffer(RolloutBuffer):
         if len(log_prob.shape) == 0:
             # Reshape 0-d tensor to avoid error
             log_prob = log_prob.reshape(-1, 1)
+        task_list = []
+        if obs:
+            for key in self.observations.keys():
+                def copy(key):
+                    #obs_ = np.array(obs[key]).copy()
+                    obs_ = obs[key]
+                    #print(key, obs_.nbytes)
+                    # Reshape needed when using multiple envs with discrete observations
+                    # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+                    if isinstance(self.observation_space.spaces[key], spaces.Discrete):
+                        obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
+                    self.observations[key][self.pos] = obs_
+                task_list.append(self.thread_pool.submit(copy, key))
 
-        for key in self.observations.keys():
-            obs_ = np.array(obs[key]).copy()
-            # Reshape needed when using multiple envs with discrete observations
-            # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
-            if isinstance(self.observation_space.spaces[key], spaces.Discrete):
-                obs_ = obs_.reshape((self.n_envs,) + self.obs_shape[key])
-            self.observations[key][self.pos] = obs_
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
         action = action.reshape((self.n_envs, self.action_dim))
 
-        self.actions[self.pos] = np.array(action).copy()
-        self.rewards[self.pos] = np.array(reward).copy()
-        self.episode_starts[self.pos] = np.array(episode_start).copy()
-        self.values[self.pos] = value.clone().cpu().numpy().flatten()
-        self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        def copy():
+            self.actions[self.pos] = np.array(action).copy()
+            self.rewards[self.pos] = np.array(reward).copy()
+            self.episode_starts[self.pos] = np.array(episode_start).copy()
+            self.values[self.pos] = value.clone().cpu().numpy().flatten()
+            self.log_probs[self.pos] = log_prob.clone().cpu().numpy()
+        task_list.append(self.thread_pool.submit(copy))
+
+        [task.result() for task in task_list]
+
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True
+
+    def get_bundle(
+        self,
+        batch_size: Optional[int] = None,
+    ) -> Generator[DictRolloutBufferSamples, None, None]:  # type: ignore[signature-mismatch] #FIXME
+        assert self.full, ""
+        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        # Prepare the data
+        if not self.generator_ready:
+            for key, obs in self.observations.items():
+                self.observations[key] = self.swap_and_flatten(obs)
+
+            _tensor_names = ["actions", "values", "log_probs", "advantages", "returns"]
+
+            for tensor in _tensor_names:
+                self.__dict__[tensor] = self.swap_and_flatten(self.__dict__[tensor])
+            self.generator_ready = True
+
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        task_list = []
+        while start_idx < self.buffer_size * self.n_envs:
+            task_list.append(self.thread_pool.submit(self._get_samples, indices[start_idx : start_idx + batch_size]))
+            if start_idx > 0 and start_idx % 16 == 0:
+                return_list = [task.result() for task in task_list]
+                task_list = []
+                yield return_list
+            start_idx += batch_size
+
+        return_list = [task.result() for task in task_list]
+        yield return_list
+        
 
     def get(
         self,

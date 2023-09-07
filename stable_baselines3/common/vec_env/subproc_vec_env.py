@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import time
 import warnings
 from collections import OrderedDict
 from multiprocessing import shared_memory
@@ -30,6 +31,7 @@ def copy_obervation_to_share_mem(observation, shm):
 def _worker(
     remote: mp.connection.Connection,
     parent_remote: mp.connection.Connection,
+    queue: mp.Queue,
     env_fn_wrapper: CloudpickleWrapper,
 ) -> None:
     # Import here to avoid a circular import
@@ -38,20 +40,38 @@ def _worker(
     parent_remote.close()
     env = _patch_env(env_fn_wrapper.var())
     reset_info: Optional[Dict[str, Any]] = {}
+    sum_of_step = 0
+    sum_of_done = 0
+    sum_of_copy = 0
+    sum_of_all = 0
+    sum_of_send = 0
     while True:
         try:
             cmd, data = remote.recv()
             if cmd == "step":
+                start_time = time.time()
                 observation, reward, terminated, truncated, info = env.step(data)
+                step_time = time.time()
                 # convert to SB3 VecEnv api
                 done = terminated or truncated
                 info["TimeLimit.truncated"] = truncated and not terminated
-                if done:
+                #if done:
                     # save final observation where user can get it, then reset
-                    info["terminal_observation"] = observation
-                    observation, reset_info = env.reset()
+                    #info["terminal_observation"] = observation
+                    #observation, reset_info = env.reset()
+                done_time = time.time()
                 new_obervation = copy_obervation_to_share_mem(observation, shm)
-                remote.send((reward, done, info, reset_info))
+                copy_time = time.time()
+                sum_of_step += step_time - start_time
+                sum_of_done += done_time - step_time
+                sum_of_copy += copy_time - done_time
+                remote.send((reward, done, info, reset_info, time.time()))
+                #queue.put((reward, done, info, reset_info, time.time()))
+                send_time = time.time()
+                sum_of_send += send_time - copy_time
+                sum_of_all += send_time - start_time
+                if done:
+                    print(env.rank, sum_of_step, sum_of_done, sum_of_copy, sum_of_send, sum_of_all)
             elif cmd == "reset":
                 observation, reset_info = env.reset(seed=data)
                 new_obervation = copy_obervation_to_share_mem(observation, shm)
@@ -119,9 +139,10 @@ class SubprocVecEnv(VecEnv):
         ctx = mp.get_context(start_method)
 
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(n_envs)])
+        self.queues = [mp.Queue() for _ in range(n_envs)]
         self.processes = []
-        for work_remote, remote, env_fn in zip(self.work_remotes, self.remotes, env_fns):
-            args = (work_remote, remote, CloudpickleWrapper(env_fn))
+        for work_remote, remote, queue, env_fn in zip(self.work_remotes, self.remotes, self.queues, env_fns):
+            args = (work_remote, remote, queue, CloudpickleWrapper(env_fn))
             # daemon=True: if the main process crashes, we should not cause things to hang
             # pytype: disable=attribute-error
             process = ctx.Process(target=_worker, args=args, daemon=True)  # type: ignore[attr-defined]
@@ -133,12 +154,33 @@ class SubprocVecEnv(VecEnv):
         self.remotes[0].send(("get_spaces", None))
         observation_space, action_space = self.remotes[0].recv()
 
+        self.sum_of_recv = 0
+        self.sum_of_zip = 0
+        self.sum_of_shared = 0
+        self.sum_of_all = 0
+        self.sum_of_send = 0
+        self.sum_of_wait = 0
+        self.sum_of_falt = 0
+        from concurrent.futures import ThreadPoolExecutor
+        self.thread_pool = ThreadPoolExecutor(max_workers=16)
+
         super().__init__(len(env_fns), observation_space, action_space)
 
     def step_async(self, actions: np.ndarray) -> None:
-        for remote, action in zip(self.remotes, actions):
-            remote.send(("step", action))
+        self.step_start_time = time.time()
+        self.task_list = []
+        def send_and_recv(remote, queue, args):
+            remote.send(args)
+            #data = queue.get() 
+            data = remote.recv()
+            return data
+
+        for remote, queue, action in zip(self.remotes, self.queues, actions):
+            self.task_list.append(self.thread_pool.submit(send_and_recv, remote, queue, ('step', action)))
+            #self.task_list.append(self.thread_pool.submit(remote.send, ('step', action)))
+            #remote.send(("step", action))
         self.waiting = True
+        self.sum_of_send += time.time() - self.step_start_time 
     
     def create_shared_mem(self, nbytes):
         self.shared_mem_list = [shared_memory.SharedMemory(size=nbytes, create=True) for _ in self.remotes]
@@ -159,11 +201,39 @@ class SubprocVecEnv(VecEnv):
 
 
     def step_wait(self) -> VecEnvStepReturn:
-        results = [remote.recv() for remote in self.remotes]
+        start_time = time.time()
+        results = [task.result() for task in self.task_list]
+        #task_list = []
+        #for idx, remote in enumerate(self.remotes):
+        #    #self.task_list[idx].result()
+        #    task_list.append(self.thread_pool.submit(remote.recv))
+        #results = [task.result() for task in task_list]
+
+        #results = [remote.recv() for remote in self.remotes]
+        recv_time = time.time()
         self.waiting = False
-        rews, dones, infos, self.reset_infos = zip(*results)
+        rews, dones, infos, self.reset_infos, time_stamp = zip(*results)
+        #print(rews, dones, infos, self.reset_infos)
+
+        self.sum_of_wait = max(time_stamp) - min(time_stamp)
+        zip_time = time.time()
         obs = self.get_obs_from_shared_mem()
-        return _flatten_obs(obs, self.observation_space), np.stack(rews), np.stack(dones), infos
+        shared_time = time.time()
+
+
+        result = _flatten_obs(obs, self.observation_space), np.stack(rews), np.stack(dones), infos
+        flatten_time = time.time()
+
+        self.sum_of_recv += recv_time - start_time
+        self.sum_of_zip +=zip_time - recv_time 
+        self.sum_of_shared +=shared_time - zip_time 
+        self.sum_of_falt += flatten_time - shared_time
+        self.sum_of_all += flatten_time- self.step_start_time 
+
+        if dones[0]:
+            print("SubproceVecEnv", self.sum_of_send, self.sum_of_recv, self.sum_of_zip, self.sum_of_shared, self.sum_of_falt)
+            print("SubproceVecEnv", self.sum_of_wait, self.sum_of_all)
+        return result
 
     def reset(self) -> VecEnvObs:
         for env_idx, remote in enumerate(self.remotes):

@@ -127,6 +127,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self.policy = self.policy.to(self.device)
 
         self.env.create_shared_mem(self.rollout_buffer.observation_nbytes())
+        #self.env.set_rollout_buffer(self.rollout_buffer)
 
     def collect_rollouts(
         self,
@@ -215,7 +216,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                     and infos[idx].get("terminal_observation") is not None
                     and infos[idx].get("TimeLimit.truncated", False)
                 ):
-                    terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    #terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
+                    terminal_obs = obs_as_tensor(new_obs[idx])
                     with th.no_grad():
                         terminal_value = self.policy.predict_values(terminal_obs)[0]  # type: ignore[arg-type]
                     rewards[idx] += self.gamma * terminal_value
@@ -243,14 +245,13 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         print("Sum of time", sum_of_cal_time / 1000, sum_of_step_time/ 1000, sum_of_buffer_time / 1000, sum_of_left_time / 1000)
         print("Sum of time", sum_of_cal_time / 1000  + sum_of_step_time/ 1000 + sum_of_buffer_time / 1000 + sum_of_left_time / 1000)
         print("Sum of time of function", time.time() - function_start_time)
-        print(dones)
-        sys.exit(0)
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         callback.update_locals(locals())
 
         callback.on_rollout_end()
+        self._last_obs = None
 
         return True
 
@@ -306,8 +307,9 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
                 self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
                 self.logger.dump(step=self.num_timesteps)
-
+            start_train_time = time.time()
             self.train()
+            print("Trainning NN cost", time.time() - start_train_time)
 
         callback.on_training_end()
 

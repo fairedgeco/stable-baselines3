@@ -198,6 +198,16 @@ class BaseAlgorithm(ABC):
                 assert np.all(
                     np.isfinite(np.array([self.action_space.low, self.action_space.high]))
                 ), "Continuous action space must have a finite lower and upper bound"
+        self.lock = None
+    
+    def set_lock(self, lock):
+        self.lock = lock
+    
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove the unpicklable entries.
+        del state['lock']
+        return state
 
     @staticmethod
     def _wrap_env(env: GymEnv, verbose: int = 0, monitor_wrapper: bool = True) -> VecEnv:

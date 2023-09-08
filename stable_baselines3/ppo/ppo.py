@@ -202,7 +202,8 @@ class PPO(OnPolicyAlgorithm):
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
-
+                if self.lock:
+                    self.lock.acquire()
                 # Re-sample the noise matrix because the log_std has changed
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
@@ -273,6 +274,8 @@ class PPO(OnPolicyAlgorithm):
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
+                if self.lock:
+                    self.lock.release()
 
             self._n_updates += 1
             if not continue_training:

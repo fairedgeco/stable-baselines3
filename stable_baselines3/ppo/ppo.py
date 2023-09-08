@@ -197,15 +197,15 @@ class PPO(OnPolicyAlgorithm):
         clip_fractions = []
 
         continue_training = True
-        previous_time = time.time()
-        sum_of_get = 0
+        sum_of_cal = 0
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
                 self.lock.acquire()
-                sum_of_get += time.time() - previous_time
+                start_time = time.time()
+                #print("Start_to train_on", time.time())
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
@@ -281,13 +281,15 @@ class PPO(OnPolicyAlgorithm):
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
+                #print("Finished train_on", time.time())
+                sum_of_cal += time.time() - start_time 
                 self.lock.release()
                 previous_time = time.time()
 
             self._n_updates += 1
             if not continue_training:
                 break
-        print("All the time cost in get", sum_of_get)
+        print("All the time cost in calculation", sum_of_cal)
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
@@ -306,6 +308,7 @@ class PPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+        print("\n")
 
     def learn(
         self: SelfPPO,

@@ -198,10 +198,23 @@ class PPO(OnPolicyAlgorithm):
             approx_kl_divs = []
             # Do a complete pass on the rollout buffer
             for rollout_data in self.rollout_buffer.get(self.batch_size):
+                use_mask = True 
                 actions = rollout_data.actions
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
+                counts = th.count_nonzero(actions, dim=None) 
+                max_counts = th.max(counts)
+                min_counts = th.min(counts)
+                if use_mask:
+                    if max_counts / min_counts < 10:
+                        max_count_action = th.argmax(counts)
+                        min_count_action = th.argmin(counts)
+                        if max_count_action != min_count_action:
+                            use_mask = False
+                    if use_mask:
+                        mask_matrix = th.full(actions.shape, 1.0, device = self.device)
+                        mask_matrix[actions==max_count_action] = 0.1
                 if self.lock:
                     self.lock.acquire()
                 # Re-sample the noise matrix because the log_std has changed
@@ -220,6 +233,9 @@ class PPO(OnPolicyAlgorithm):
                 ratio = th.exp(log_prob - rollout_data.old_log_prob)
 
                 # clipped surrogate loss
+
+                if use_mask:
+                    advantages = advantages * mask_matrix
                 policy_loss_1 = advantages * ratio
                 policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                 policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
@@ -239,7 +255,10 @@ class PPO(OnPolicyAlgorithm):
                         values - rollout_data.old_values, -clip_range_vf, clip_range_vf
                     )
                 # Value loss using the TD(gae_lambda) target
-                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                if use_mask:
+                    masked_returns = rollout_data.returns * mask_matrix
+                    values_pred = values_pred * mask_matrix
+                value_loss = F.mse_loss(masked_returns, values_pred)
                 value_losses.append(value_loss.item())
 
                 # Entropy loss favor exploration

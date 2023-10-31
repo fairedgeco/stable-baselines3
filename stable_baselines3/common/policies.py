@@ -438,7 +438,12 @@ class ActorCriticPolicy(BasePolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        MlpExtractorClass = "",
+        extractor_kwargs: Optional[Dict[str, Any]] = {},
     ):
+
+        self.MlpExtractorClass = MlpExtractorClass
+        self.extractor_kwargs = extractor_kwargs
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
             # Small values to avoid NaN in Adam optimizer
@@ -547,11 +552,12 @@ class ActorCriticPolicy(BasePolicy):
         # Note: If net_arch is None and some features extractor is used,
         #       net_arch here is an empty list and mlp_extractor does not
         #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = MlpExtractor(
+        self.mlp_extractor = self.MlpExtractorClass(
             self.features_dim,
             net_arch=self.net_arch,
             activation_fn=self.activation_fn,
             device=self.device,
+            **(self.extractor_kwargs),
         )
 
     def _build(self, lr_schedule: Schedule) -> None:
@@ -849,6 +855,8 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: Type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
+        MlpExtractorClass = "",
+        extractor_kwargs: Optional[Dict[str, Any]] = {},
     ):
         super().__init__(
             observation_space,
@@ -868,6 +876,8 @@ class MultiInputActorCriticPolicy(ActorCriticPolicy):
             normalize_images,
             optimizer_class,
             optimizer_kwargs,
+            MlpExtractorClass,
+            extractor_kwargs,
         )
 
 

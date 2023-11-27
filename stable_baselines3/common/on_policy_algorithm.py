@@ -77,6 +77,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
         supported_action_spaces: Optional[Tuple[Type[spaces.Space], ...]] = None,
+        allow_leave_earlier = False,
     ):
         super().__init__(
             policy=policy,
@@ -100,6 +101,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
+        self.allow_leave_earlier = allow_leave_earlier
 
         if _init_setup_model:
             self._setup_model()
@@ -214,6 +216,11 @@ class OnPolicyAlgorithm(BaseAlgorithm):
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
+            if self.allow_leave_earlier and dones.shape[0] == 1 and dones[0]:
+                rollout_buffer.buffer_size = rollout_buffer.pos
+                rollout_buffer.full = True
+                break
+        
 
         with th.no_grad():
             # Compute value for the last timestep
@@ -244,6 +251,7 @@ class OnPolicyAlgorithm(BaseAlgorithm):
         progress_bar: bool = False,
     ) -> SelfOnPolicyAlgorithm:
         iteration = 0
+        self.rollout_buffer.buffer_size = self.n_steps 
 
         total_timesteps, callback = self._setup_learn(
             total_timesteps,
@@ -281,6 +289,8 @@ class OnPolicyAlgorithm(BaseAlgorithm):
                 self.logger.dump(step=self.num_timesteps)
 
             self.train()
+            if self.rollout_buffer.buffer_size != self.n_steps:
+                break
 
         callback.on_training_end()
 

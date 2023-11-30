@@ -193,6 +193,11 @@ class SubprocVecEnv(VecEnv):
         for remote in target_remotes:
             remote.send(("is_wrapped", wrapper_class))
         return [remote.recv() for remote in target_remotes]
+    
+    def terminate_subprocess(self):
+        print("Get terminate signal in subproc_vec_env.py")
+        [process.terminate() for process in self.processes]
+        
 
     def _get_target_remotes(self, indices: VecEnvIndices) -> List[Any]:
         """
